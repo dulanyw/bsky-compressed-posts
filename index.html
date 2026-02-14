@@ -1,0 +1,322 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Bluesky Blob Encoder / Decoder</title>
+<style>
+  body{font-family:system-ui;margin:24px;max-width:1100px}
+  textarea{width:100%;min-height:180px;padding:12px;font-size:14px;box-sizing:border-box}
+  button{padding:10px 14px;cursor:pointer}
+  .row{display:flex;gap:10px;margin:12px 0;flex-wrap:wrap;align-items:center}
+  .grid{display:grid;gap:14px}
+  @media(min-width:900px){.grid{grid-template-columns:1fr 1fr}}
+  .error{color:#b00020;white-space:pre-wrap}
+  .ok{color:#087a08;white-space:pre-wrap}
+  .hint{color:#666;font-size:13px}
+  .mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:13px}
+  .pill{padding:2px 8px;border:1px solid #ddd;border-radius:999px;font-size:12px;color:#444}
+</style>
+</head>
+
+<body>
+<h1>Bluesky Blob Encoder / Decoder</h1>
+<p class="hint">Encode text → Unicode blob. Paste blob → decode. Blobs start with <span class="mono">~</span>.</p>
+
+<div class="row">
+  <span class="pill">Format: UC v1</span>
+  <span class="pill">Compression: deflate (pako)</span>
+  <span class="pill" id="alphaPill">Alphabet: …</span>
+</div>
+
+<div id="status" class="hint"></div>
+<div id="ok" class="ok"></div>
+<div id="err" class="error"></div>
+
+<div class="grid">
+  <div>
+    <h3>Text</h3>
+    <textarea id="plain" placeholder="Type/paste text here…"></textarea>
+    <div class="row">
+      <button id="encodeBtn">Encode →</button>
+      <button id="copyTextBtn">Copy</button>
+    </div>
+  </div>
+
+  <div>
+    <h3>Blob</h3>
+    <textarea id="blob" class="mono" placeholder="Encoded blob appears here…"></textarea>
+    <div class="row">
+      <button id="decodeBtn">← Decode</button>
+      <button id="copyBlobBtn">Copy</button>
+    </div>
+  </div>
+</div>
+
+<!-- If jsdelivr is blocked, swap to:
+<script src="https://unpkg.com/pako@2.1.0/dist/pako.min.js"></script>
+-->
+<script src="https://cdn.jsdelivr.net/npm/pako@2.1.0/dist/pako.min.js"></script>
+
+<script>
+document.addEventListener("DOMContentLoaded", () => {
+  const plain = document.getElementById("plain");
+  const blob  = document.getElementById("blob");
+  const ok    = document.getElementById("ok");
+  const err   = document.getElementById("err");
+  const status= document.getElementById("status");
+  const alphaPill = document.getElementById("alphaPill");
+
+  function msgOK(t){ ok.textContent=t||""; err.textContent=""; }
+  function msgERR(t){ err.textContent=String(t||""); ok.textContent=""; }
+  function stat(t){ status.textContent=t||""; }
+
+  if (!window.pako) { msgERR("pako failed to load."); return; }
+
+  // -------- Grapheme count (Bluesky-ish) --------
+  const seg = ("Segmenter" in Intl) ? new Intl.Segmenter(undefined, { granularity:"grapheme" }) : null;
+  function gLen(s){
+    if (!s) return 0;
+    if (seg) { let c=0; for (const _ of seg.segment(s)) c++; return c; }
+    return [...s].length;
+  }
+
+  // -------- Alphabet (build as codepoints) --------
+  function ascii(){
+    return "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!#$%&'()*+,-./:;=?@[]^_{|}~<>\"";
+  }
+  function range(a,b){
+    let out = "";
+    for (let cp=a; cp<=b; cp++){
+      if (cp>=0xD800 && cp<=0xDFFF) continue; // surrogates
+      const ch = String.fromCodePoint(cp);
+      if (/\s/u.test(ch)) continue;
+      if (ch === "\\" || ch === "`") continue;
+      out += ch;
+    }
+    return out;
+  }
+  function buildAlphabetString(){
+    // Includes astral emoji — OK, as long as we index via Array.from(codepoints).
+    const parts = [
+      ascii(),
+      range(0x00A1,0x00FF),
+      range(0x0100,0x017F),
+      range(0x0370,0x03FF),
+      range(0x0400,0x04FF),
+      range(0x3040,0x309F),
+      range(0x30A0,0x30FF),
+      range(0xAC00,0xD7A3),
+      range(0x1F600,0x1F64F), // emoji faces (astral)
+    ];
+    // De-dup by *codepoint*
+    const seen = new Set();
+    const out = [];
+    for (const ch of parts.join("")) { // for..of iterates codepoints
+      if (!seen.has(ch)) { seen.add(ch); out.push(ch); }
+    }
+    return out.join("");
+  }
+
+  const ALPH_STR = buildAlphabetString();
+  const ALPH = Array.from(ALPH_STR);          // ✅ codepoints array
+  const ZERO_DIGIT = ALPH[0];
+  const BASE = BigInt(ALPH.length);
+
+  alphaPill.textContent = "Alphabet: " + ALPH.length.toLocaleString();
+
+  // Build index map using codepoints
+  const IDX = new Map();
+  for (let i=0; i<ALPH.length; i++) IDX.set(ALPH[i], BigInt(i));
+
+  // -------- Varint --------
+  function vEnc(n){
+    const o=[];
+    while(true){
+      let b=n&0x7F;
+      n>>>=7;
+      if(n) o.push(b|0x80);
+      else { o.push(b); break; }
+    }
+    return new Uint8Array(o);
+  }
+  function vDec(bytes,pos){
+    let n=0,shift=0,i=pos;
+    while(i<bytes.length){
+      const b=bytes[i++];
+      n|=(b&0x7F)<<shift;
+      if(!(b&0x80)) return [n>>>0,i];
+      shift+=7;
+      if (shift>70) throw new Error("varint too long");
+    }
+    throw new Error("bad varint");
+  }
+
+  // -------- CRC32 --------
+  const CRCT=(()=>{const t=new Uint32Array(256);
+    for(let i=0;i<256;i++){let c=i;
+      for(let k=0;k<8;k++) c=(c&1)?0xEDB88320^(c>>>1):(c>>>1);
+      t[i]=c>>>0;
+    }
+    return t;
+  })();
+
+  function crc(buf){
+    let c=0^-1;
+    for(let i=0;i<buf.length;i++) c=(c>>>8)^CRCT[(c^buf[i])&255];
+    return (c^-1)>>>0;
+  }
+
+  // -------- Base-N encode/decode (BigInt, codepoint-safe) --------
+  function bEnc(bytes){
+    if(!bytes.length) return "";
+
+    // leading 0x00 bytes -> leading ZERO_DIGIT
+    let leadingZeros=0;
+    for(const b of bytes){ if(b===0) leadingZeros++; else break; }
+
+    let n=0n;
+    for(const b of bytes) n=(n<<8n)|BigInt(b);
+
+    const d=[];
+    while(n>0n){
+      const r=n%BASE;
+      n/=BASE;
+      d.push(ALPH[Number(r)]);   // ✅ array indexing, safe for emoji
+    }
+    d.reverse();
+
+    if(leadingZeros) d.unshift(...new Array(leadingZeros).fill(ZERO_DIGIT));
+    return d.join("");
+  }
+
+  function bDec(str){
+    if(!str) return new Uint8Array(0);
+
+    // codepoints
+    const chars = Array.from(str);
+
+    // leading ZERO_DIGIT -> leading 0x00 bytes
+    let zeros=0;
+    while(zeros<chars.length && chars[zeros]===ZERO_DIGIT) zeros++;
+
+    let n=0n;
+    for(let i=zeros;i<chars.length;i++){
+      const v=IDX.get(chars[i]);
+      if(v===undefined) throw new Error("Invalid character in blob: " + JSON.stringify(chars[i]));
+      n=n*BASE+v;
+    }
+
+    const raw=[];
+    while(n>0n){
+      raw.push(Number(n&0xFFn));
+      n>>=8n;
+    }
+    raw.reverse();
+
+    const out=new Uint8Array(zeros+raw.length);
+    out.set(raw, zeros);
+    return out;
+  }
+
+  // -------- UC v1 format --------
+  // MAGIC(2) VER(1) FLAGS(1) varint(orig_len) varint(comp_len) comp CRC32(4)
+  const MAGIC0=0x55, MAGIC1=0x43; // "UC"
+  const VERSION=1;
+  const FLAG_ZLIB=2;
+
+  function encode(text, level=9){
+    const payload=new TextEncoder().encode(text);
+    const c=crc(payload);
+
+    const comp=window.pako.deflate(payload,{level}); // zlib-wrapped DEFLATE
+    const a=vEnc(payload.length);
+    const b=vEnc(comp.length);
+
+    const frame=new Uint8Array(2+1+1+a.length+b.length+comp.length+4);
+    let p=0;
+    frame[p++]=MAGIC0; frame[p++]=MAGIC1;
+    frame[p++]=VERSION;
+    frame[p++]=FLAG_ZLIB;
+    frame.set(a,p); p+=a.length;
+    frame.set(b,p); p+=b.length;
+    frame.set(comp,p); p+=comp.length;
+    frame[p++]=(c>>>24)&255;
+    frame[p++]=(c>>>16)&255;
+    frame[p++]=(c>>>8)&255;
+    frame[p++]=c&255;
+
+    return "~"+bEnc(frame);
+  }
+
+  function decode(b){
+    b=(b||"").trim();
+    if(b.startsWith("~")) b=b.slice(1);
+
+    const frame=bDec(b);
+    if(frame.length<8) throw new Error("Blob too short");
+    if(frame[0]!==MAGIC0 || frame[1]!==MAGIC1) throw new Error("Bad magic");
+    if(frame[2]!==VERSION) throw new Error("Unsupported version: "+frame[2]);
+    if((frame[3]&FLAG_ZLIB)===0) throw new Error("Unsupported flags: "+frame[3]);
+
+    let [origLen, i1]=vDec(frame,4);
+    let [compLen, i2]=vDec(frame,i1);
+
+    const end = i2 + compLen;
+    if(end+4>frame.length) throw new Error("Truncated compressed bytes");
+
+    const comp=frame.slice(i2,end);
+    const crcE =
+      (frame[end]<<24) | (frame[end+1]<<16) | (frame[end+2]<<8) | (frame[end+3]);
+
+    const out=window.pako.inflate(comp);
+    if(out.length!==origLen) throw new Error("Length mismatch");
+    if((crc(out)>>>0)!==(crcE>>>0)) throw new Error("CRC mismatch");
+
+    return new TextDecoder("utf-8",{fatal:true}).decode(out);
+  }
+
+  // -------- UI --------
+  function updateStatus(extra){
+    const bg=gLen(blob.value||"");
+    const pg=gLen(plain.value||"");
+    let t=`Decoded: ${pg} graphemes | Encoded: ${bg} graphemes`;
+    if(bg>300) t+="  ⚠ Encoded exceeds 300 graphemes.";
+    if(extra) t+=" | "+extra;
+    stat(t);
+  }
+
+  document.getElementById("encodeBtn").onclick=async()=>{
+    msgOK(""); msgERR("");
+    updateStatus("Encoding…");
+    await new Promise(requestAnimationFrame);
+    try{
+      const r=encode(plain.value||"", 9);
+      blob.value=r;
+      msgOK("Encoded OK.");
+      updateStatus("Done");
+    }catch(e){ msgERR(e); updateStatus("Encode failed"); }
+  };
+
+  document.getElementById("decodeBtn").onclick=async()=>{
+    msgOK(""); msgERR("");
+    updateStatus("Decoding…");
+    await new Promise(requestAnimationFrame);
+    try{
+      plain.value=decode(blob.value||"");
+      msgOK("Decoded OK.");
+      updateStatus("Done");
+    }catch(e){ msgERR(e); updateStatus("Decode failed"); }
+  };
+
+  document.getElementById("copyBlobBtn").onclick=()=>navigator.clipboard.writeText(blob.value||"");
+  document.getElementById("copyTextBtn").onclick=()=>navigator.clipboard.writeText(plain.value||"");
+  plain.addEventListener("input",()=>updateStatus());
+  blob.addEventListener("input",()=>updateStatus());
+
+  updateStatus("Ready");
+  msgOK("Ready.");
+});
+</script>
+</body>
+</html>
